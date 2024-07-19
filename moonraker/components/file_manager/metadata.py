@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     pass
 
 UFP_MODEL_PATH = "/3D/model.gcode"
-UFP_THUMB_PATH = "/Metadata/thumbnail.png"
+UFP_THUMB_PATH = "/Metadata/thumbnail.jpg"
 
 def log_to_stderr(msg: str) -> None:
     sys.stderr.write(f"{msg}\n")
@@ -217,10 +217,17 @@ class BaseSlicer(object):
         return None
 
     def parse_thumbnails(self) -> Optional[List[Dict[str, Any]]]:
+        is_jpg = False
         for data in [self.header_data, self.footer_data]:
             thumb_matches: List[str] = re.findall(
                 r"; thumbnail begin[;/\+=\w\s]+?; thumbnail end", data)
             if thumb_matches:
+                break
+            else:
+                thumb_matches: List[str] = re.findall(
+                r"; thumbnail_JPG begin[;/\+=\w\s]+?; thumbnail_JPG end", data)
+            if thumb_matches:
+                is_jpg = True
                 break
         else:
             return None
@@ -233,7 +240,7 @@ class BaseSlicer(object):
                 return None
         thumb_base = os.path.splitext(os.path.basename(self.path))[0]
         parsed_matches: List[Dict[str, Any]] = []
-        has_miniature: bool = False
+        #has_miniature: bool = False
         for match in thumb_matches:
             lines = re.split(r"\r?\n", match.replace('; ', ''))
             info = _regex_find_ints(r".*", lines[0])
@@ -248,7 +255,10 @@ class BaseSlicer(object):
                     f"MetadataError: Thumbnail Size Mismatch: "
                     f"detected {info[2]}, actual {len(data)}")
                 continue
-            thumb_name = f"{thumb_base}-{info[0]}x{info[1]}.png"
+            if not is_jpg:
+                thumb_name = f"{thumb_base}-{info[0]}x{info[1]}.png"
+            else:
+                thumb_name = f"{thumb_base}-{info[0]}x{info[1]}.jpg"
             thumb_path = os.path.join(thumb_dir, thumb_name)
             rel_thumb_path = os.path.join(".thumbs", thumb_name)
             with open(thumb_path, "wb") as f:
@@ -257,33 +267,71 @@ class BaseSlicer(object):
                 'width': info[0], 'height': info[1],
                 'size': os.path.getsize(thumb_path),
                 'relative_path': rel_thumb_path})
-            if info[0] == 32 and info[1] == 32:
-                has_miniature = True
-        if len(parsed_matches) > 0 and not has_miniature:
-            # find the largest thumb index
-            largest_match = parsed_matches[0]
-            for item in parsed_matches:
-                if item['size'] > largest_match['size']:
-                    largest_match = item
-            # Create miniature thumbnail if one does not exist
-            thumb_full_name = largest_match['relative_path'].split("/")[-1]
-            thumb_path = os.path.join(thumb_dir, f"{thumb_full_name}")
-            rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.png")
-            thumb_path_small = os.path.join(
-                thumb_dir, f"{thumb_base}-32x32.png")
-            # read file
-            try:
-                with Image.open(thumb_path) as im:
-                    # Create 32x32 thumbnail
-                    im.thumbnail((32, 32))
-                    im.save(thumb_path_small, format="PNG")
-                    parsed_matches.insert(0, {
-                        'width': im.width, 'height': im.height,
-                        'size': os.path.getsize(thumb_path_small),
-                        'relative_path': rel_path_small
-                    })
-            except Exception as e:
-                log_to_stderr(str(e))
+        # find the smallest thumb index
+        smallest_match = parsed_matches[0]
+        max_size = min_size = smallest_match['size']
+        for item in parsed_matches:
+            if item['size'] < smallest_match['size']:
+                smallest_match = item
+            if item["size"] < min_size:
+                min_size = item["size"]
+            if item["size"] > max_size:
+                max_size = item["size"]
+        # Create thumbnail for screen
+        thumb_full_name = smallest_match['relative_path'].split("/")[-1]
+        thumb_path = os.path.join(thumb_dir, f"{thumb_full_name}")
+        thumb_QD_full_name = f"{thumb_base}-{smallest_match['width']}x{smallest_match['height']}_QD.jpg"
+        thumb_QD_path = os.path.join(thumb_dir, f"{thumb_QD_full_name}")
+        rel_path_QD = os.path.join(".thumbs", thumb_QD_full_name)
+        try:
+            with Image.open(thumb_path) as img:
+                img = img.convert("RGB")
+                img = img.resize((smallest_match['width'], smallest_match['height']))
+                img = img.rotate(90, expand=True)
+                img.save(thumb_QD_path, "JPEG", quality=90)
+        except Exception as e:
+            log_to_stderr(f"convert failed: {e}")
+        parsed_matches.append({
+            'width': smallest_match['width'], 'height': smallest_match['height'],
+            'size': (max_size + min_size) // 2,
+            'relative_path': rel_path_QD})
+        #     if info[0] == 32 and info[1] == 32:
+        #         has_miniature = True
+        # if len(parsed_matches) > 0 and not has_miniature:
+        #     # find the largest thumb index
+        #     largest_match = parsed_matches[0]
+        #     for item in parsed_matches:
+        #         if item['size'] > largest_match['size']:
+        #             largest_match = item
+        #     # Create miniature thumbnail if one does not exist
+        #     thumb_full_name = largest_match['relative_path'].split("/")[-1]
+        #     thumb_path = os.path.join(thumb_dir, f"{thumb_full_name}")
+        #     rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.jpg")
+        #     thumb_path_small = os.path.join(
+        #         thumb_dir, f"{thumb_base}-32x32.jpg")
+        #     rel_path_small_png = os.path.join(".thumbs", f"{thumb_base}-32x32.png")
+        #     thumb_path_small_png = os.path.join(
+        #         thumb_dir, f"{thumb_base}-32x32.png")
+        #     # read file
+        #     try:
+        #         with Image.open(thumb_path) as im:
+        #             # Create 32x32 thumbnail
+        #             im.thumbnail((32, 32))
+        #             im.save(thumb_path_small_png)
+        #             im = im.convert('RGB')
+        #             im.save(thumb_path_small)
+        #             parsed_matches.insert(0, {
+        #                 'width': im.width, 'height': im.height,
+        #                 'size': os.path.getsize(thumb_path_small),
+        #                 'relative_path': rel_path_small
+        #             })
+        #             parsed_matches.insert(0, {
+        #                 'width': im.width, 'height': im.height,
+        #                 'size': os.path.getsize(thumb_path_small_png),
+        #                 'relative_path': rel_path_small_png
+        #             })
+        #     except Exception as e:
+        #         log_to_stderr(str(e))
         return parsed_matches
 
     def parse_layer_count(self) -> Optional[int]:
@@ -383,7 +431,7 @@ class PrusaSlicer(BaseSlicer):
         return _regex_find_string(
             r";\sfilament_type\s=\s(.*)", self.footer_data)
 
-    def parse_filament_name(self) -> Optional[str]:       
+    def parse_filament_name(self) -> Optional[str]:
         return _regex_find_string(
             r";\sfilament_settings_id\s=\s(.*)", self.footer_data)
 
@@ -549,10 +597,10 @@ class Cura(BaseSlicer):
         # Check for thumbnails extracted from the ufp
         thumb_dir = os.path.join(os.path.dirname(self.path), ".thumbs")
         thumb_base = os.path.splitext(os.path.basename(self.path))[0]
-        thumb_path = os.path.join(thumb_dir, f"{thumb_base}.png")
-        rel_path_full = os.path.join(".thumbs", f"{thumb_base}.png")
-        rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.png")
-        thumb_path_small = os.path.join(thumb_dir, f"{thumb_base}-32x32.png")
+        thumb_path = os.path.join(thumb_dir, f"{thumb_base}.jpg")
+        rel_path_full = os.path.join(".thumbs", f"{thumb_base}.jpg")
+        rel_path_small = os.path.join(".thumbs", f"{thumb_base}-32x32.jpg")
+        thumb_path_small = os.path.join(thumb_dir, f"{thumb_base}-32x32.jpg")
         if not os.path.isfile(thumb_path):
             return None
         # read file
@@ -566,7 +614,7 @@ class Cura(BaseSlicer):
                 })
                 # Create 32x32 thumbnail
                 im.thumbnail((32, 32), Image.ANTIALIAS)
-                im.save(thumb_path_small, format="PNG")
+                im.save(thumb_path_small, format="JPEG")
                 thumbs.insert(0, {
                     'width': im.width, 'height': im.height,
                     'size': os.path.getsize(thumb_path_small),
@@ -1087,7 +1135,7 @@ def extract_ufp(ufp_path: str, dest_path: str) -> None:
         log_to_stderr(f"UFP file Not Found: {ufp_path}")
         sys.exit(-1)
     thumb_name = os.path.splitext(
-        os.path.basename(dest_path))[0] + ".png"
+        os.path.basename(dest_path))[0] + ".jpg"
     dest_thumb_dir = os.path.join(os.path.dirname(dest_path), ".thumbs")
     dest_thumb_path = os.path.join(dest_thumb_dir, thumb_name)
     try:

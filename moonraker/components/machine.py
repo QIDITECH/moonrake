@@ -105,10 +105,6 @@ class Machine:
         self.server.register_endpoint(
             "/machine/system_info", ['POST'],
             self._handle_sysinfo_request)
-        # self.server.register_endpoint(
-            # "/machine/dev_name", ['GET'],
-            # self._handle_devname_request)
-
 
         self.server.register_notification("machine:service_state_changed")
 
