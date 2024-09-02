@@ -5,6 +5,8 @@
 # This file may be distributed under the terms of the GNU GPLv3 license
 
 from __future__ import annotations
+import os
+import contextlib
 import asyncio
 import inspect
 import functools
@@ -15,22 +17,35 @@ from typing import (
     TYPE_CHECKING,
     Awaitable,
     Callable,
-    Coroutine,
     Optional,
     Tuple,
     TypeVar,
     Union
 )
 
+_uvl_var = os.getenv("MOONRAKER_ENABLE_UVLOOP", "y").lower()
+_uvl_enabled = False
+if _uvl_var in ["y", "yes", "true"]:
+    with contextlib.suppress(ImportError):
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+        _uvl_enabled = True
+
 if TYPE_CHECKING:
+    from asyncio import AbstractEventLoop
     _T = TypeVar("_T")
     FlexCallback = Callable[..., Optional[Awaitable]]
     TimerCallback = Callable[[float], Union[float, Awaitable[float]]]
 
 class EventLoop:
+    UVLOOP_ENABLED = _uvl_enabled
     TimeoutError = asyncio.TimeoutError
     def __init__(self) -> None:
         self.reset()
+
+    @property
+    def asyncio_loop(self) -> AbstractEventLoop:
+        return self.aioloop
 
     def reset(self) -> None:
         self.aioloop = self._create_new_loop()
@@ -67,11 +82,16 @@ class EventLoop:
                           *args,
                           **kwargs
                           ) -> None:
-        if inspect.iscoroutinefunction(callback):
-            self.aioloop.create_task(callback(*args, **kwargs))  # type: ignore
-        else:
-            self.aioloop.call_soon(
-                functools.partial(callback, *args, **kwargs))
+        async def _wrapper():
+            try:
+                ret = callback(*args, **kwargs)
+                if inspect.isawaitable(ret):
+                    await ret
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logging.exception("Error Running Callback")
+        self.aioloop.create_task(_wrapper())
 
     def delay_callback(self,
                        delay: float,
@@ -79,22 +99,13 @@ class EventLoop:
                        *args,
                        **kwargs
                        ) -> asyncio.TimerHandle:
-        if inspect.iscoroutinefunction(callback):
-            return self.aioloop.call_later(
-                delay, self._async_callback,
-                functools.partial(callback, *args, **kwargs))
-        else:
-            return self.aioloop.call_later(
-                delay, functools.partial(callback, *args, **kwargs))
+        return self.aioloop.call_later(
+            delay, self.register_callback,
+            functools.partial(callback, *args, **kwargs)
+        )
 
     def register_timer(self, callback: TimerCallback):
         return FlexTimer(self, callback)
-
-    def _async_callback(self, callback: Callable[[], Coroutine]) -> None:
-        # This wrapper delays creation of the coroutine object.  In the
-        # event that a callback is cancelled this prevents "coroutine
-        # was never awaited" warnings in asyncio
-        self.aioloop.create_task(callback())
 
     def run_in_thread(self,
                       callback: Callable[..., _T],
@@ -158,12 +169,18 @@ class FlexTimer:
         self.eventloop = eventloop
         self.callback = callback
         self.timer_handle: Optional[asyncio.TimerHandle] = None
+        self.timer_task: Optional[asyncio.Task] = None
         self.running: bool = False
+
+    def in_callback(self) -> bool:
+        return self.timer_task is not None and not self.timer_task.done()
 
     def start(self, delay: float = 0.):
         if self.running:
             return
         self.running = True
+        if self.in_callback():
+            return
         call_time = self.eventloop.get_loop_time() + delay
         self.timer_handle = self.eventloop.call_at(
             call_time, self._schedule_task)
@@ -176,9 +193,14 @@ class FlexTimer:
             self.timer_handle.cancel()
             self.timer_handle = None
 
+    async def wait_timer_done(self) -> None:
+        if self.timer_task is None:
+            return
+        await self.timer_task
+
     def _schedule_task(self):
         self.timer_handle = None
-        self.eventloop.create_task(self._call_wrapper())
+        self.timer_task = self.eventloop.create_task(self._call_wrapper())
 
     def is_running(self) -> bool:
         return self.running
@@ -186,8 +208,14 @@ class FlexTimer:
     async def _call_wrapper(self):
         if not self.running:
             return
-        ret = self.callback(self.eventloop.get_loop_time())
-        if isinstance(ret, Awaitable):
-            ret = await ret
+        try:
+            ret = self.callback(self.eventloop.get_loop_time())
+            if isinstance(ret, Awaitable):
+                ret = await ret
+        except Exception:
+            self.running = False
+            raise
+        finally:
+            self.timer_task = None
         if self.running:
             self.timer_handle = self.eventloop.call_at(ret, self._schedule_task)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import time
 import logging
+from ..common import JobEvent, RequestType
 
 # Annotation imports
 from typing import (
@@ -19,8 +20,8 @@ from typing import (
     Union,
 )
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
-    from websockets import WebRequest
+    from ..confighelper import ConfigHelper
+    from ..common import WebRequest, UserInfo
     from .klippy_apis import KlippyAPI
     from .file_manager.file_manager import FileManager
 
@@ -46,11 +47,8 @@ class JobQueue:
         self.server.register_event_handler(
             "server:klippy_shutdown", self._handle_shutdown)
         self.server.register_event_handler(
-            "job_state:complete", self._on_job_complete)
-        self.server.register_event_handler(
-            "job_state:error", self._on_job_abort)
-        self.server.register_event_handler(
-            "job_state:cancelled", self._on_job_abort)
+            "job_state:state_changed", self._on_job_state_changed
+        )
 
         self.server.register_notification("job_queue:job_queue_changed")
         self.server.register_remote_method("pause_job_queue", self.pause_queue)
@@ -58,14 +56,21 @@ class JobQueue:
                                            self.start_queue)
 
         self.server.register_endpoint(
-            "/server/job_queue/job", ['POST', 'DELETE'],
-            self._handle_job_request)
+            "/server/job_queue/job", RequestType.POST | RequestType.DELETE,
+            self._handle_job_request
+        )
         self.server.register_endpoint(
-            "/server/job_queue/pause", ['POST'], self._handle_pause_queue)
+            "/server/job_queue/pause", RequestType.POST, self._handle_pause_queue
+        )
         self.server.register_endpoint(
-            "/server/job_queue/start", ['POST'], self._handle_start_queue)
+            "/server/job_queue/start", RequestType.POST, self._handle_start_queue
+        )
         self.server.register_endpoint(
-            "/server/job_queue/status", ['GET'], self._handle_queue_status)
+            "/server/job_queue/status", RequestType.GET, self._handle_queue_status
+        )
+        self.server.register_endpoint(
+            "/server/job_queue/jump", RequestType.POST, self._handle_jump
+        )
 
     async def _handle_ready(self) -> None:
         async with self.lock:
@@ -83,10 +88,15 @@ class JobQueue:
         if not self.queued_jobs and self.automatic:
             self._set_queue_state("ready")
 
-    async def _on_job_complete(self,
-                               prev_stats: Dict[str, Any],
-                               new_stats: Dict[str, Any]
-                               ) -> None:
+    async def _on_job_state_changed(self, job_event: JobEvent, *args) -> None:
+        if job_event == JobEvent.COMPLETE:
+            await self._on_job_complete()
+        elif job_event.aborted:
+            await self._on_job_abort()
+
+    async def _on_job_complete(self) -> None:
+        if not self.automatic:
+            return
         async with self.lock:
             # Transition to the next job in the queue
             if self.queue_state == "ready" and self.queued_jobs:
@@ -95,10 +105,7 @@ class JobQueue:
                 self.pop_queue_handle = event_loop.delay_callback(
                     self.job_delay, self._pop_job)
 
-    async def _on_job_abort(self,
-                            prev_stats: Dict[str, Any],
-                            new_stats: Dict[str, Any]
-                            ) -> None:
+    async def _on_job_abort(self) -> None:
         async with self.lock:
             if self.queued_jobs:
                 self._set_queue_state("paused")
@@ -128,7 +135,9 @@ class JobQueue:
                         raise self.server.error(
                             "Queue State Changed during Transition Gcode")
                 self._set_queue_state("starting")
-                await kapis.start_print(filename)
+                await kapis.start_print(
+                    filename, wait_klippy_started=True, user=job.user
+                )
             except self.server.error:
                 logging.exception(f"Error Loading print: {filename}")
                 self._set_queue_state("paused")
@@ -157,7 +166,9 @@ class JobQueue:
 
     async def queue_job(self,
                         filenames: Union[str, List[str]],
-                        check_exists: bool = True
+                        check_exists: bool = True,
+                        reset: bool = False,
+                        user: Optional[UserInfo] = None
                         ) -> None:
         async with self.lock:
             # Make sure that the file exists
@@ -167,8 +178,10 @@ class JobQueue:
                 # Make sure all files exist before adding them to the queue
                 for fname in filenames:
                     self._check_job_file(fname)
+            if reset:
+                self.queued_jobs.clear()
             for fname in filenames:
-                queued_job = QueuedJob(fname)
+                queued_job = QueuedJob(fname, user)
                 self.queued_jobs[queued_job.job_id] = queued_job
             self._send_queue_event(action="jobs_added")
 
@@ -209,9 +222,12 @@ class JobQueue:
                     self._set_queue_state("loading")
                     event_loop = self.server.get_event_loop()
                     self.pop_queue_handle = event_loop.delay_callback(
-                        0.01, self._pop_job)
+                        0.01, self._pop_job, False
+                    )
                 else:
-                    self._set_queue_state("ready")
+                    qs = "ready" if self.automatic else "paused"
+                    self._set_queue_state(qs)
+
     def _job_map_to_list(self) -> List[Dict[str, Any]]:
         cur_time = time.time()
         return [job.as_dict(cur_time) for
@@ -241,27 +257,24 @@ class JobQueue:
                 'queue_state': self.queue_state
             })
 
-    async def _handle_job_request(self,
-                                  web_request: WebRequest
-                                  ) -> Dict[str, Any]:
-        action = web_request.get_action()
-        if action == "POST":
-            files: Union[List[str], str] = web_request.get('filenames')
-            if isinstance(files, str):
-                files = [f.strip() for f in files.split(',') if f.strip()]
+    async def _handle_job_request(
+        self, web_request: WebRequest
+    ) -> Dict[str, Any]:
+        req_type = web_request.get_request_type()
+        if req_type == RequestType.POST:
+            files = web_request.get_list('filenames')
+            reset = web_request.get_boolean("reset", False)
             # Validate that all files exist before queueing
-            await self.queue_job(files)
-        elif action == "DELETE":
+            user = web_request.get_current_user()
+            await self.queue_job(files, reset=reset, user=user)
+        elif req_type == RequestType.DELETE:
             if web_request.get_boolean("all", False):
                 await self.delete_job([], all=True)
             else:
-                job_ids: Union[List[str], str] = web_request.get('job_ids')
-                if isinstance(job_ids, str):
-                    job_ids = [f.strip() for f in job_ids.split(',')
-                               if f.strip()]
+                job_ids = web_request.get_list('job_ids')
                 await self.delete_job(job_ids)
         else:
-            raise self.server.error(f"Invalid action: {action}")
+            raise self.server.error(f"Invalid request type: {req_type}")
         return {
             'queued_jobs': self._job_map_to_list(),
             'queue_state': self.queue_state
@@ -293,17 +306,36 @@ class JobQueue:
             'queue_state': self.queue_state
         }
 
+    async def _handle_jump(self, web_request: WebRequest) -> Dict[str, Any]:
+        job_id: str = web_request.get("job_id")
+        async with self.lock:
+            job = self.queued_jobs.pop(job_id, None)
+            if job is None:
+                raise self.server.error(f"Invalid job id: {job_id}")
+            new_queue = {job_id: job}
+            new_queue.update(self.queued_jobs)
+            self.queued_jobs = new_queue
+        return {
+            'queued_jobs': self._job_map_to_list(),
+            'queue_state': self.queue_state
+        }
+
     async def close(self):
         await self.pause_queue()
 
 class QueuedJob:
-    def __init__(self, filename: str) -> None:
+    def __init__(self, filename: str, user: Optional[UserInfo] = None) -> None:
         self.filename = filename
         self.job_id = f"{id(self):016X}"
         self.time_added = time.time()
+        self._user = user
 
     def __str__(self) -> str:
         return self.filename
+
+    @property
+    def user(self) -> Optional[UserInfo]:
+        return self._user
 
     def as_dict(self, cur_time: float) -> Dict[str, Any]:
         return {

@@ -5,8 +5,12 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 from __future__ import annotations
-from utils import SentinelClass
-from websockets import WebRequest, Subscribable
+import logging
+from ..utils import Sentinel
+from ..common import WebRequest, APITransport, RequestType
+import os
+import shutil
+import json
 
 # Annotation imports
 from typing import (
@@ -18,12 +22,16 @@ from typing import (
     List,
     TypeVar,
     Mapping,
+    Callable,
+    Coroutine
 )
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
-    from websockets import WebRequest
-    from klippy_connection import KlippyConnection as Klippy
+    from ..confighelper import ConfigHelper
+    from ..common import UserInfo
+    from .klippy_connection import KlippyConnection as Klippy
+    from .file_manager.file_manager import FileManager
     Subscription = Dict[str, Optional[List[Any]]]
+    SubCallback = Callable[[Dict[str, Dict[str, Any]], float], Optional[Coroutine]]
     _T = TypeVar("_T")
 
 INFO_ENDPOINT = "info"
@@ -35,31 +43,55 @@ SUBSCRIPTION_ENDPOINT = "objects/subscribe"
 STATUS_ENDPOINT = "objects/query"
 OBJ_LIST_ENDPOINT = "objects/list"
 REG_METHOD_ENDPOINT = "register_remote_method"
-SENTINEL = SentinelClass.get_instance()
 
-class KlippyAPI(Subscribable):
+class KlippyAPI(APITransport):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
         self.klippy: Klippy = self.server.lookup_component("klippy_connection")
+        self.fm: FileManager = self.server.lookup_component("file_manager")
+        self.eventloop = self.server.get_event_loop()
         app_args = self.server.get_app_args()
         self.version = app_args.get('software_version')
         # Maintain a subscription for all moonraker requests, as
         # we do not want to overwrite them
         self.host_subscription: Subscription = {}
+        self.subscription_callbacks: List[SubCallback] = []
 
         # Register GCode Aliases
         self.server.register_endpoint(
-            "/printer/print/pause", ['POST'], self._gcode_pause)
+            "/printer/print/pause", RequestType.POST, self._gcode_pause
+        )
         self.server.register_endpoint(
-            "/printer/print/resume", ['POST'], self._gcode_resume)
+            "/printer/print/resume", RequestType.POST, self._gcode_resume
+        )
         self.server.register_endpoint(
-            "/printer/print/cancel", ['POST'], self._gcode_cancel)
+            "/printer/print/cancel", RequestType.POST, self._gcode_cancel
+        )
         self.server.register_endpoint(
-            "/printer/print/start", ['POST'], self._gcode_start_print)
+            "/printer/print/start", RequestType.POST, self._gcode_start_print
+        )
         self.server.register_endpoint(
-            "/printer/restart", ['POST'], self._gcode_restart)
+            "/printer/restart", RequestType.POST, self._gcode_restart
+        )
         self.server.register_endpoint(
-            "/printer/firmware_restart", ['POST'], self._gcode_firmware_restart)
+            "/printer/firmware_restart", RequestType.POST, self._gcode_firmware_restart
+        )
+        self.server.register_event_handler(
+            "server:klippy_disconnect", self._on_klippy_disconnect
+        )
+        self.server.register_endpoint(
+            "/printer/list_endpoints", RequestType.GET, self.list_endpoints
+        )
+        self.server.register_endpoint(
+            "/printer/breakheater", RequestType.POST, self.breakheater
+        )
+        self.server.register_endpoint(
+            "/printer/breakmacro", RequestType.POST, self.breakmacro
+        )
+
+    def _on_klippy_disconnect(self) -> None:
+        self.host_subscription.clear()
+        self.subscription_callbacks.clear()
 
     async def _gcode_pause(self, web_request: WebRequest) -> str:
         return await self.pause_print()
@@ -72,7 +104,8 @@ class KlippyAPI(Subscribable):
 
     async def _gcode_start_print(self, web_request: WebRequest) -> str:
         filename: str = web_request.get_str('filename')
-        return await self.start_print(filename)
+        user = web_request.get_current_user()
+        return await self.start_print(filename, user=user)
 
     async def _gcode_restart(self, web_request: WebRequest) -> str:
         return await self.do_restart("RESTART")
@@ -80,32 +113,39 @@ class KlippyAPI(Subscribable):
     async def _gcode_firmware_restart(self, web_request: WebRequest) -> str:
         return await self.do_restart("FIRMWARE_RESTART")
 
-    async def _send_klippy_request(self,
-                                   method: str,
-                                   params: Dict[str, Any],
-                                   default: Any = SENTINEL
-                                   ) -> Any:
+    async def _send_klippy_request(
+        self,
+        method: str,
+        params: Dict[str, Any],
+        default: Any = Sentinel.MISSING,
+        transport: Optional[APITransport] = None
+    ) -> Any:
         try:
-            result = await self.klippy.request(
-                WebRequest(method, params, conn=self))
+            req = WebRequest(method, params, transport=transport or self)
+            result = await self.klippy.request(req)
         except self.server.error:
-            if isinstance(default, SentinelClass):
+            if default is Sentinel.MISSING:
                 raise
             result = default
         return result
 
     async def run_gcode(self,
                         script: str,
-                        default: Any = SENTINEL
+                        default: Any = Sentinel.MISSING
                         ) -> str:
         params = {'script': script}
         result = await self._send_klippy_request(
             GCODE_ENDPOINT, params, default)
         return result
 
-    async def start_print(self, filename: str) -> str:
+    async def start_print(
+        self,
+        filename: str,
+        wait_klippy_started: bool = False,
+        user: Optional[UserInfo] = None
+    ) -> str:
         # WARNING: Do not call this method from within the following
-        # event handlers:
+        # event handlers when "wait_klippy_started" is set to True:
         # klippy_identified, klippy_started, klippy_ready, klippy_disconnect
         # Doing so will result in "wait_started" blocking for the specifed
         # timeout (default 20s) and returning False.
@@ -114,38 +154,78 @@ class KlippyAPI(Subscribable):
             filename = filename[1:]
         # Escape existing double quotes in the file name
         filename = filename.replace("\"", "\\\"")
+        homedir = os.path.expanduser("~")
+        if os.path.split(filename)[0].split(os.path.sep)[0] != ".cache":
+            base_path = os.path.join(homedir, "printer_data/gcodes")
+            target = os.path.join(".cache", os.path.basename(filename))
+            cache_path = os.path.join(base_path, ".cache")
+            if not os.path.exists(cache_path):
+                os.makedirs(cache_path)
+            shutil.rmtree(cache_path)
+            os.makedirs(cache_path)
+            metadata = self.fm.gcode_metadata.metadata.get(filename, None)
+            self.copy_file_to_cache(os.path.join(base_path, filename), os.path.join(base_path, target))
+            msg = "// metadata=" + json.dumps(metadata)
+            self.server.send_event("server:gcode_response", msg)
+            filename = target
         script = f'SDCARD_PRINT_FILE FILENAME="{filename}"'
-        await self.klippy.wait_started()
-        return await self.run_gcode(script)
+        if wait_klippy_started:
+            await self.klippy.wait_started()
+        logging.info(f"Requesting Job Start, filename = {filename}")
+        ret = await self.run_gcode(script)
+        self.server.send_event("klippy_apis:job_start_complete", user)
+        return ret
 
     async def pause_print(
-        self, default: Union[SentinelClass, _T] = SENTINEL
+        self, default: Union[Sentinel, _T] = Sentinel.MISSING
     ) -> Union[_T, str]:
         self.server.send_event("klippy_apis:pause_requested")
+        logging.info("Requesting job pause...")
         return await self._send_klippy_request(
             "pause_resume/pause", {}, default)
 
     async def resume_print(
-        self, default: Union[SentinelClass, _T] = SENTINEL
+        self, default: Union[Sentinel, _T] = Sentinel.MISSING
     ) -> Union[_T, str]:
         self.server.send_event("klippy_apis:resume_requested")
+        logging.info("Requesting job resume...")
         return await self._send_klippy_request(
             "pause_resume/resume", {}, default)
 
     async def cancel_print(
-        self, default: Union[SentinelClass, _T] = SENTINEL
+        self, default: Union[Sentinel, _T] = Sentinel.MISSING
     ) -> Union[_T, str]:
         self.server.send_event("klippy_apis:cancel_requested")
+        logging.info("Requesting job cancel...")
+        await self._send_klippy_request(
+            "breakmacro", {}, default)
+        await self._send_klippy_request(
+            "breakheater", {}, default)
         return await self._send_klippy_request(
             "pause_resume/cancel", {}, default)
+    
+    async def breakheater(
+        self, default: Union[Sentinel, _T] = Sentinel.MISSING
+    ) -> Union[_T, str]:
+        return await self._send_klippy_request(
+            "breakheater", {}, default)
+    
+    async def breakmacro(
+        self, default: Union[Sentinel, _T] = Sentinel.MISSING
+    ) -> Union[_T, str]:
+        return await self._send_klippy_request(
+            "breakmacro", {}, default)
 
-    async def do_restart(self, gc: str) -> str:
+    async def do_restart(
+        self, gc: str, wait_klippy_started: bool = False
+    ) -> str:
         # WARNING: Do not call this method from within the following
-        # event handlers:
+        # event handlers when "wait_klippy_started" is set to True:
         # klippy_identified, klippy_started, klippy_ready, klippy_disconnect
         # Doing so will result in "wait_started" blocking for the specifed
         # timeout (default 20s) and returning False.
-        await self.klippy.wait_started()
+        if wait_klippy_started:
+            await self.klippy.wait_started()
         try:
             result = await self.run_gcode(gc)
         except self.server.error as e:
@@ -156,7 +236,7 @@ class KlippyAPI(Subscribable):
         return result
 
     async def list_endpoints(self,
-                             default: Union[SentinelClass, _T] = SENTINEL
+                             default: Union[Sentinel, _T] = Sentinel.MISSING
                              ) -> Union[_T, Dict[str, List[str]]]:
         return await self._send_klippy_request(
             LIST_EPS_ENDPOINT, {}, default)
@@ -166,7 +246,7 @@ class KlippyAPI(Subscribable):
 
     async def get_klippy_info(self,
                               send_id: bool = False,
-                              default: Union[SentinelClass, _T] = SENTINEL
+                              default: Union[Sentinel, _T] = Sentinel.MISSING
                               ) -> Union[_T, Dict[str, Any]]:
         params = {}
         if send_id:
@@ -175,29 +255,36 @@ class KlippyAPI(Subscribable):
         return await self._send_klippy_request(INFO_ENDPOINT, params, default)
 
     async def get_object_list(self,
-                              default: Union[SentinelClass, _T] = SENTINEL
+                              default: Union[Sentinel, _T] = Sentinel.MISSING
                               ) -> Union[_T, List[str]]:
         result = await self._send_klippy_request(
             OBJ_LIST_ENDPOINT, {}, default)
         if isinstance(result, dict) and 'objects' in result:
             return result['objects']
-        return result
+        if default is not Sentinel.MISSING:
+            return default
+        raise self.server.error("Invalid response received from Klippy", 500)
 
     async def query_objects(self,
                             objects: Mapping[str, Optional[List[str]]],
-                            default: Union[SentinelClass, _T] = SENTINEL
+                            default: Union[Sentinel, _T] = Sentinel.MISSING
                             ) -> Union[_T, Dict[str, Any]]:
         params = {'objects': objects}
         result = await self._send_klippy_request(
             STATUS_ENDPOINT, params, default)
-        if isinstance(result, dict) and 'status' in result:
-            return result['status']
-        return result
+        if isinstance(result, dict) and "status" in result:
+            return result["status"]
+        if default is not Sentinel.MISSING:
+            return default
+        raise self.server.error("Invalid response received from Klippy", 500)
 
-    async def subscribe_objects(self,
-                                objects: Mapping[str, Optional[List[str]]],
-                                default: Union[SentinelClass, _T] = SENTINEL
-                                ) -> Union[_T, Dict[str, Any]]:
+    async def subscribe_objects(
+        self,
+        objects: Mapping[str, Optional[List[str]]],
+        callback: Optional[SubCallback] = None,
+        default: Union[Sentinel, _T] = Sentinel.MISSING
+    ) -> Union[_T, Dict[str, Any]]:
+        # The host transport shares subscriptions amongst all components
         for obj, items in objects.items():
             if obj in self.host_subscription:
                 prev = self.host_subscription[obj]
@@ -208,12 +295,31 @@ class KlippyAPI(Subscribable):
                     self.host_subscription[obj] = uitems
             else:
                 self.host_subscription[obj] = items
-        params = {'objects': self.host_subscription}
+        params = {"objects": dict(self.host_subscription)}
+        result = await self._send_klippy_request(SUBSCRIPTION_ENDPOINT, params, default)
+        if isinstance(result, dict) and "status" in result:
+            if callback is not None:
+                self.subscription_callbacks.append(callback)
+            return result["status"]
+        if default is not Sentinel.MISSING:
+            return default
+        raise self.server.error("Invalid response received from Klippy", 500)
+
+    async def subscribe_from_transport(
+        self,
+        objects: Mapping[str, Optional[List[str]]],
+        transport: APITransport,
+        default: Union[Sentinel, _T] = Sentinel.MISSING,
+    ) -> Union[_T, Dict[str, Any]]:
+        params = {"objects": dict(objects)}
         result = await self._send_klippy_request(
-            SUBSCRIPTION_ENDPOINT, params, default)
-        if isinstance(result, dict) and 'status' in result:
-            return result['status']
-        return result
+            SUBSCRIPTION_ENDPOINT, params, default, transport
+        )
+        if isinstance(result, dict) and "status" in result:
+            return result["status"]
+        if default is not Sentinel.MISSING:
+            return default
+        raise self.server.error("Invalid response received from Klippy", 500)
 
     async def subscribe_gcode_output(self) -> str:
         template = {'response_template':
@@ -226,11 +332,23 @@ class KlippyAPI(Subscribable):
             {'response_template': {"method": method_name},
              'remote_method': method_name})
 
-    def send_status(self,
-                    status: Dict[str, Any],
-                    eventtime: float
-                    ) -> None:
+    def send_status(
+        self, status: Dict[str, Any], eventtime: float
+    ) -> None:
+        for cb in self.subscription_callbacks:
+            self.eventloop.register_callback(cb, status, eventtime)
         self.server.send_event("server:status_update", status)
+
+    def copy_file_to_cache(self, origin, target):
+        stat = os.statvfs("/")
+        free_space = stat.f_frsize * stat.f_bfree
+        filesize = os.path.getsize(os.path.join(origin))
+        if (filesize < free_space):
+            shutil.copy(origin, target)
+        else:
+            msg = "!! Insufficient disk space, unable to read the file."
+            self.server.send_event("server:gcode_response", msg)
+            raise self.server.error("Insufficient disk space, unable to read the file.", 500)
 
 def load_component(config: ConfigHelper) -> KlippyAPI:
     return KlippyAPI(config)

@@ -8,12 +8,19 @@ from __future__ import annotations
 import socket
 import asyncio
 import logging
-import json
 import pathlib
 import ssl
 from collections import deque
 import paho.mqtt.client as paho_mqtt
-from websockets import Subscribable, WebRequest, JsonRPC, APITransport
+import paho.mqtt
+from ..common import (
+    TransportType,
+    RequestType,
+    WebRequest,
+    APITransport,
+    KlippyState
+)
+from ..utils import json_wrapper as jsonw
 
 # Annotation imports
 from typing import (
@@ -30,12 +37,14 @@ from typing import (
     Deque,
 )
 if TYPE_CHECKING:
-    from app import APIDefinition
-    from confighelper import ConfigHelper
-    from klippy_connection import KlippyConnection as Klippy
+    from ..confighelper import ConfigHelper
+    from ..common import JsonRPC, APIDefinition
+    from ..eventloop import FlexTimer
+    from .klippy_apis import KlippyAPI
     FlexCallback = Callable[[bytes], Optional[Coroutine]]
     RPCCallback = Callable[..., Coroutine]
 
+PAHO_MQTT_VERSION = tuple([int(p) for p in paho.mqtt.__version__.split(".")])
 DUP_API_REQ_CODE = -10000
 MQTT_PROTOCOLS = {
     'v3.1': paho_mqtt.MQTTv31,
@@ -54,21 +63,37 @@ class ExtPahoClient(paho_mqtt.Client):
         if self._port <= 0:
             raise ValueError('Invalid port number.')
 
-        self._in_packet = {
-            "command": 0,
-            "have_remaining": 0,
-            "remaining_count": [],
-            "remaining_mult": 1,
-            "remaining_length": 0,
-            "packet": b"",
-            "to_process": 0,
-            "pos": 0}
+        if PAHO_MQTT_VERSION >= (2, 0):
+            return self._v2_reconnect(sock)
+        if PAHO_MQTT_VERSION < (1, 6):
+            # Paho Mqtt Version < 1.6.x
+            self._in_packet = {
+                "command": 0,
+                "have_remaining": 0,
+                "remaining_count": [],
+                "remaining_mult": 1,
+                "remaining_length": 0,
+                "packet": b"",
+                "to_process": 0,
+                "pos": 0
+            }
+            with self._out_packet_mutex:
+                self._out_packet = deque()  # type: ignore
 
-        with self._out_packet_mutex:
+            with self._current_out_packet_mutex:
+                self._current_out_packet = None
+        else:
+            self._in_packet = {
+                "command": 0,
+                "have_remaining": 0,
+                "remaining_count": [],
+                "remaining_mult": 1,
+                "remaining_length": 0,
+                "packet": bytearray(b""),
+                "to_process": 0,
+                "pos": 0
+            }
             self._out_packet = deque()  # type: ignore
-
-        with self._current_out_packet_mutex:
-            self._current_out_packet = None
 
         with self._msgtime_mutex:
             self._last_msg_in = paho_mqtt.time_func()
@@ -120,7 +145,7 @@ class ExtPahoClient(paho_mqtt.Client):
             sock.do_handshake()
 
             if verify_host:
-                ssl.match_hostname(sock.getpeercert(), self._host)
+                ssl.match_hostname(sock.getpeercert(), self._host)  # type: ignore
 
         if self._transport == "websockets":
             sock.settimeout(self._keepalive)
@@ -136,6 +161,65 @@ class ExtPahoClient(paho_mqtt.Client):
         self._call_socket_open()
 
         return self._send_connect(self._keepalive)
+
+    def _v2_reconnect(self, sock: Optional[socket.socket] = None):
+        self._in_packet = {
+            "command": 0,
+            "have_remaining": 0,
+            "remaining_count": [],
+            "remaining_mult": 1,
+            "remaining_length": 0,
+            "packet": bytearray(b""),
+            "to_process": 0,
+            "pos": 0,
+        }
+
+        self._ping_t = 0.0  # type: ignore
+        self._state = paho_mqtt._ConnectionState.MQTT_CS_CONNECTING
+
+        self._sock_close()
+
+        # Mark all currently outgoing QoS = 0 packets as lost,
+        # or `wait_for_publish()` could hang forever
+        for pkt in self._out_packet:
+            if (
+                pkt["command"] & 0xF0 == paho_mqtt.PUBLISH and
+                pkt["qos"] == 0 and pkt["info"] is not None
+            ):
+                pkt["info"].rc = paho_mqtt.MQTT_ERR_CONN_LOST
+                pkt["info"]._set_as_published()
+
+        self._out_packet.clear()
+
+        with self._msgtime_mutex:
+            self._last_msg_in = paho_mqtt.time_func()
+            self._last_msg_out = paho_mqtt.time_func()
+
+        # Put messages in progress in a valid state.
+        self._messages_reconnect_reset()
+
+        with self._callback_mutex:
+            on_pre_connect = self.on_pre_connect
+
+        if on_pre_connect:
+            try:
+                on_pre_connect(self, self._userdata)
+            except Exception as err:
+                self._easy_log(
+                    paho_mqtt.MQTT_LOG_ERR,
+                    'Caught exception in on_pre_connect: %s', err
+                )
+                if not self.suppress_exceptions:
+                    raise
+
+        self._sock = sock or self._create_socket()
+
+        self._sock.setblocking(False)  # type: ignore[attr-defined]
+        self._registered_write = False
+        self._call_socket_open(self._sock)
+
+        return self._send_connect(self._keepalive)
+
 
 class SubscriptionHandle:
     def __init__(self, topic: str, callback: FlexCallback) -> None:
@@ -227,13 +311,13 @@ class AIOHelper:
         logging.info("MQTT Misc Loop Complete")
 
 
-class MQTTClient(APITransport, Subscribable):
+class MQTTClient(APITransport):
     def __init__(self, config: ConfigHelper) -> None:
         self.server = config.get_server()
-        self.event_loop = self.server.get_event_loop()
-        self.klippy: Klippy = self.server.lookup_component("klippy_connection")
+        self.eventloop = self.server.get_event_loop()
         self.address: str = config.get('address')
         self.port: int = config.getint('port', 1883)
+        self.tls_enabled: bool = config.getboolean("enable_tls", False)
         user = config.gettemplate('username', None)
         self.user_name: Optional[str] = None
         if user:
@@ -266,7 +350,14 @@ class MQTTClient(APITransport, Subscribable):
             raise config.error(
                 "Option 'default_qos' in section [mqtt] must be "
                 "between 0 and 2")
-        self.client = ExtPahoClient(protocol=self.protocol)
+        self.publish_split_status = \
+            config.getboolean("publish_split_status", False)
+        if PAHO_MQTT_VERSION < (2, 0):
+            self.client = ExtPahoClient(protocol=self.protocol)
+        else:
+            self.client = ExtPahoClient(
+                paho_mqtt.CallbackAPIVersion.VERSION1, protocol=self.protocol
+            )
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
         self.client.on_disconnect = self._on_disconnect
@@ -280,42 +371,54 @@ class MQTTClient(APITransport, Subscribable):
         self.pending_responses: List[asyncio.Future] = []
         self.pending_acks: Dict[int, asyncio.Future] = {}
 
+        # We don't need to register these endpoints over the MQTT transport as they
+        # are redundant.  MQTT clients can already publish and subscribe.
+        ep_transports = TransportType.all() & ~TransportType.MQTT
         self.server.register_endpoint(
-            "/server/mqtt/publish", ["POST"],
-            self._handle_publish_request,
-            transports=["http", "websocket", "internal"])
+            "/server/mqtt/publish", RequestType.POST, self._handle_publish_request,
+            transports=ep_transports
+        )
         self.server.register_endpoint(
-            "/server/mqtt/subscribe", ["POST"],
+            "/server/mqtt/subscribe", RequestType.POST,
             self._handle_subscription_request,
-            transports=["http", "websocket", "internal"])
+            transports=ep_transports
+        )
 
         # Subscribe to API requests
-        self.json_rpc = JsonRPC(transport="MQTT")
         self.api_request_topic = f"{self.instance_name}/moonraker/api/request"
         self.api_resp_topic = f"{self.instance_name}/moonraker/api/response"
         self.klipper_status_topic = f"{self.instance_name}/klipper/status"
+        self.klipper_state_prefix = f"{self.instance_name}/klipper/state"
         self.moonraker_status_topic = f"{self.instance_name}/moonraker/status"
-        status_cfg: Dict[str, Any] = config.getdict("status_objects", {},
-                                                    allow_empty_fields=True)
-        self.status_objs: Dict[str, Any] = {}
+        status_cfg: Dict[str, str] = config.getdict(
+            "status_objects", {}, allow_empty_fields=True
+        )
+        self.status_interval = config.getfloat("status_interval", 0, above=.25)
+        self.status_cache: Dict[str, Dict[str, Any]] = {}
+        self.status_update_timer: Optional[FlexTimer] = None
+        self.last_status_time = 0.
+        self.status_objs: Dict[str, Optional[List[str]]] = {}
         for key, val in status_cfg.items():
             if val is not None:
-                self.status_objs[key] = [v.strip() for v in val.split(',')
-                                         if v.strip()]
+                self.status_objs[key] = [v.strip() for v in val.split(',') if v.strip()]
             else:
                 self.status_objs[key] = None
         if status_cfg:
             logging.debug(f"MQTT: Status Objects Set: {self.status_objs}")
-            self.server.register_event_handler("server:klippy_identified",
-                                               self._handle_klippy_identified)
+            self.server.register_event_handler(
+                "server:klippy_started", self._handle_klippy_started
+            )
+            self.server.register_event_handler(
+                "server:klippy_disconnect", self._handle_klippy_disconnect
+            )
+            if self.status_interval:
+                self.status_update_timer = self.eventloop.register_timer(
+                    self._handle_timed_status_update
+                )
 
         self.timestamp_deque: Deque = deque(maxlen=20)
         self.api_qos = config.getint('api_qos', self.qos)
         if config.getboolean("enable_moonraker_api", True):
-            api_cache = self.server.register_api_transport("mqtt", self)
-            for api_def in api_cache.values():
-                if "mqtt" in api_def.supported_transports:
-                    self.register_api_handler(api_def)
             self.subscribe_topic(self.api_request_topic,
                                  self._process_api_request,
                                  self.api_qos)
@@ -336,21 +439,31 @@ class MQTTClient(APITransport, Subscribable):
         if self.user_name is not None:
             self.client.username_pw_set(self.user_name, self.password)
         self.client.will_set(self.moonraker_status_topic,
-                             payload=json.dumps({'server': 'offline'}),
+                             payload=jsonw.dumps({'server': 'offline'}),
                              qos=self.qos, retain=True)
+        if self.tls_enabled:
+            self.client.tls_set()
         self.client.connect_async(self.address, self.port)
-        self.connect_task = self.event_loop.create_task(
+        self.connect_task = self.eventloop.create_task(
             self._do_reconnect(first=True)
         )
 
-    async def _handle_klippy_identified(self) -> None:
+    async def _handle_klippy_started(self, state: KlippyState) -> None:
         if self.status_objs:
-            args = {'objects': self.status_objs}
-            try:
-                await self.klippy.request(
-                    WebRequest("objects/subscribe", args, conn=self))
-            except self.server.error:
-                pass
+            kapi: KlippyAPI = self.server.lookup_component("klippy_apis")
+            await kapi.subscribe_from_transport(
+                self.status_objs, self, default=None,
+            )
+            if self.status_update_timer is not None:
+                self.status_update_timer.start(delay=self.status_interval)
+
+    def _handle_klippy_disconnect(self):
+        if self.status_update_timer is not None:
+            self.status_update_timer.stop()
+        if self.status_cache:
+            payload = self.status_cache
+            self.status_cache = {}
+            self._publish_status_update(payload, self.last_status_time)
 
     def _on_message(self,
                     client: str,
@@ -361,7 +474,7 @@ class MQTTClient(APITransport, Subscribable):
         if topic in self.subscribed_topics:
             cb_hdls = self.subscribed_topics[topic][1]
             for hdl in cb_hdls:
-                self.event_loop.register_callback(
+                self.eventloop.register_callback(
                     hdl.callback, message.payload)
         else:
             logging.debug(
@@ -383,7 +496,7 @@ class MQTTClient(APITransport, Subscribable):
             if subs:
                 res, msg_id = client.subscribe(subs)
                 if msg_id is not None:
-                    sub_fut: asyncio.Future = asyncio.Future()
+                    sub_fut: asyncio.Future = self.eventloop.create_future()
                     topics = list(self.subscribed_topics.keys())
                     sub_fut.add_done_callback(
                         BrokerAckLogger(topics, "subscribe"))
@@ -457,14 +570,14 @@ class MQTTClient(APITransport, Subscribable):
                     raise
             first = False
             try:
-                sock = await self.event_loop.create_socket_connection(
+                sock = await self.eventloop.create_socket_connection(
                     (self.address, self.port), timeout=10
                 )
                 self.client.reconnect(sock)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                if type(last_err) != type(e) or last_err.args != e.args:
+                if type(last_err) is not type(e) or last_err.args != e.args:
                     logging.exception("MQTT Connection Error")
                     last_err = e
                 continue
@@ -505,7 +618,7 @@ class MQTTClient(APITransport, Subscribable):
         if self.is_connected() and need_sub:
             res, msg_id = self.client.subscribe(topic, qos)
             if msg_id is not None:
-                sub_fut: asyncio.Future = asyncio.Future()
+                sub_fut: asyncio.Future = self.eventloop.create_future()
                 sub_fut.add_done_callback(
                     BrokerAckLogger([topic], "subscribe"))
                 self.pending_acks[msg_id] = sub_fut
@@ -523,7 +636,7 @@ class MQTTClient(APITransport, Subscribable):
                 del self.subscribed_topics[topic]
                 res, msg_id = self.client.unsubscribe(topic)
                 if msg_id is not None:
-                    unsub_fut: asyncio.Future = asyncio.Future()
+                    unsub_fut: asyncio.Future = self.eventloop.create_future()
                     unsub_fut.add_done_callback(
                         BrokerAckLogger([topic], "unsubscribe"))
                     self.pending_acks[msg_id] = unsub_fut
@@ -537,11 +650,11 @@ class MQTTClient(APITransport, Subscribable):
         qos = qos or self.qos
         if qos > 2 or qos < 0:
             raise self.server.error("QOS must be between 0 and 2")
-        pub_fut: asyncio.Future = asyncio.Future()
+        pub_fut: asyncio.Future = self.eventloop.create_future()
         if isinstance(payload, (dict, list)):
             try:
-                payload = json.dumps(payload)
-            except json.JSONDecodeError:
+                payload = jsonw.dumps(payload)
+            except jsonw.JSONDecodeError:
                 raise self.server.error(
                     "Dict or List is not json encodable") from None
         elif isinstance(payload, bool):
@@ -584,7 +697,7 @@ class MQTTClient(APITransport, Subscribable):
         qos = qos or self.qos
         if qos > 2 or qos < 0:
             raise self.server.error("QOS must be between 0 and 2")
-        resp_fut: asyncio.Future = asyncio.Future()
+        resp_fut: asyncio.Future = self.eventloop.create_future()
         resp_hdl = self.subscribe_topic(
             response_topic, resp_fut.set_result, qos)
         self.pending_responses.append(resp_fut)
@@ -626,7 +739,7 @@ class MQTTClient(APITransport, Subscribable):
         topic: str = web_request.get_str("topic")
         qos: int = web_request.get_int("qos", self.qos)
         timeout: Optional[float] = web_request.get_float('timeout', None)
-        resp: asyncio.Future = asyncio.Future()
+        resp: asyncio.Future = self.eventloop.create_future()
         hdl: Optional[SubscriptionHandle] = None
         try:
             hdl = self.subscribe_topic(topic, resp.set_result, qos)
@@ -643,8 +756,8 @@ class MQTTClient(APITransport, Subscribable):
             if hdl is not None:
                 self.unsubscribe(hdl)
         try:
-            payload = json.loads(ret)
-        except json.JSONDecodeError:
+            payload = jsonw.loads(ret)
+        except jsonw.JSONDecodeError:
             payload = ret.decode()
         return {
             'topic': topic,
@@ -652,51 +765,19 @@ class MQTTClient(APITransport, Subscribable):
         }
 
     async def _process_api_request(self, payload: bytes) -> None:
-        response = await self.json_rpc.dispatch(payload.decode())
+        rpc: JsonRPC = self.server.lookup_component("jsonrpc")
+        response = await rpc.dispatch(payload, self)
         if response is not None:
             await self.publish_topic(self.api_resp_topic, response,
                                      self.api_qos)
 
-    def register_api_handler(self, api_def: APIDefinition) -> None:
-        if api_def.callback is None:
-            # Remote API, uses RPC to reach out to Klippy
-            mqtt_method = api_def.jrpc_methods[0]
-            rpc_cb = self._generate_remote_callback(api_def.endpoint)
-            self.json_rpc.register_method(mqtt_method, rpc_cb)
-        else:
-            # Local API, uses local callback
-            for mqtt_method, req_method in \
-                    zip(api_def.jrpc_methods, api_def.request_methods):
-                rpc_cb = self._generate_local_callback(
-                    api_def.endpoint, req_method, api_def.callback)
-                self.json_rpc.register_method(mqtt_method, rpc_cb)
-        logging.info(
-            "Registering MQTT JSON-RPC methods: "
-            f"{', '.join(api_def.jrpc_methods)}")
+    @property
+    def transport_type(self) -> TransportType:
+        return TransportType.MQTT
 
-    def remove_api_handler(self, api_def: APIDefinition) -> None:
-        for jrpc_method in api_def.jrpc_methods:
-            self.json_rpc.remove_method(jrpc_method)
-
-    def _generate_local_callback(self,
-                                 endpoint: str,
-                                 request_method: str,
-                                 callback: Callable[[WebRequest], Coroutine]
-                                 ) -> RPCCallback:
-        async def func(args: Dict[str, Any]) -> Any:
-            self._check_timestamp(args)
-            result = await callback(WebRequest(endpoint, args, request_method))
-            return result
-        return func
-
-    def _generate_remote_callback(self, endpoint: str) -> RPCCallback:
-        async def func(args: Dict[str, Any]) -> Any:
-            self._check_timestamp(args)
-            result = await self.klippy.request(WebRequest(endpoint, args))
-            return result
-        return func
-
-    def _check_timestamp(self, args: Dict[str, Any]) -> None:
+    def screen_rpc_request(
+        self, api_def: APIDefinition, req_type: RequestType, args: Dict[str, Any]
+    ) -> None:
         ts = args.pop("mqtt_timestamp", None)
         if ts is not None:
             if ts in self.timestamp_deque:
@@ -706,19 +787,43 @@ class MQTTClient(APITransport, Subscribable):
             else:
                 self.timestamp_deque.append(ts)
 
-    def send_status(self,
-                    status: Dict[str, Any],
-                    eventtime: float
-                    ) -> None:
+    def send_status(self, status: Dict[str, Any], eventtime: float) -> None:
         if not status or not self.is_connected():
             return
-        payload = {'eventtime': eventtime, 'status': status}
-        self.publish_topic(self.klipper_status_topic, payload)
+        if not self.status_interval:
+            self._publish_status_update(status, eventtime)
+        else:
+            for key, val in status.items():
+                self.status_cache.setdefault(key, {}).update(val)
+            self.last_status_time = eventtime
+
+    def _handle_timed_status_update(self, eventtime: float) -> float:
+        if self.status_cache:
+            payload = self.status_cache
+            self.status_cache = {}
+            self._publish_status_update(payload, self.last_status_time)
+        return eventtime + self.status_interval
+
+    def _publish_status_update(self, status: Dict[str, Any], eventtime: float) -> None:
+        if self.publish_split_status:
+            for objkey in status:
+                objval = status[objkey]
+                for statekey in objval:
+                    payload = {'eventtime': eventtime, 'value': objval[statekey]}
+                    self.publish_topic(
+                        f"{self.klipper_state_prefix}/{objkey}/{statekey}",
+                        payload, retain=True)
+        else:
+            payload = {'eventtime': eventtime, 'status': status}
+            self.publish_topic(self.klipper_status_topic, payload)
+
 
     def get_instance_name(self) -> str:
         return self.instance_name
 
     async def close(self) -> None:
+        if self.status_update_timer is not None:
+            self.status_update_timer.stop()
         if self.connect_task is not None:
             self.connect_task.cancel()
             self.connect_task = None

@@ -11,20 +11,20 @@ import asyncio
 import logging
 import email.utils
 import xml.etree.ElementTree as etree
+from ..common import RequestType
 from typing import (
     TYPE_CHECKING,
     Awaitable,
     List,
     Dict,
     Any,
-    Optional,
-    Union
+    Optional
 )
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
-    from websockets import WebRequest
-    from http_client import HttpClient
-    from components.database import MoonrakerDatabase
+    from ..confighelper import ConfigHelper
+    from ..common import WebRequest
+    from .http_client import HttpClient
+    from .database import MoonrakerDatabase
 
 
 MOONLIGHT_URL = "https://arksine.github.io/moonlight"
@@ -58,23 +58,23 @@ class Announcements:
             )
 
         self.server.register_endpoint(
-            "/server/announcements/list", ["GET"],
+            "/server/announcements/list", RequestType.GET,
             self._list_announcements
         )
         self.server.register_endpoint(
-            "/server/announcements/dismiss", ["POST"],
+            "/server/announcements/dismiss", RequestType.POST,
             self._handle_dismiss_request
         )
         self.server.register_endpoint(
-            "/server/announcements/update", ["POST"],
+            "/server/announcements/update", RequestType.POST,
             self._handle_update_request
         )
         self.server.register_endpoint(
-            "/server/announcements/feed", ["POST", "DELETE"],
+            "/server/announcements/feed", RequestType.POST | RequestType.DELETE,
             self._handle_feed_request
         )
         self.server.register_endpoint(
-            "/server/announcements/feeds", ["GET"],
+            "/server/announcements/feeds", RequestType.GET,
             self._handle_list_feeds
         )
         self.server.register_notification(
@@ -143,12 +143,7 @@ class Announcements:
     async def _handle_update_request(
         self, web_request: WebRequest
     ) -> Dict[str, Any]:
-        subs: Optional[Union[str, List[str]]]
-        subs = web_request.get("subscriptions", None)
-        if isinstance(subs, str):
-            subs = [sub.strip() for sub in subs.split(",") if sub.strip()]
-        elif subs is None:
-            subs = list(self.subscriptions.keys())
+        subs = web_request.get_list("subscriptions", list(self.subscriptions.keys()))
         for sub in subs:
             if sub not in self.subscriptions:
                 raise self.server.error(f"No subscription for {sub}")
@@ -176,13 +171,13 @@ class Announcements:
     async def _handle_feed_request(
         self, web_request: WebRequest
     ) -> Dict[str, Any]:
-        action = web_request.get_action()
+        req_type = web_request.get_request_type()
         name: str = web_request.get("name")
         name = name.lower()
         changed: bool = False
         db: MoonrakerDatabase = self.server.lookup_component("database")
         result = "skipped"
-        if action == "POST":
+        if req_type == RequestType.POST:
             if name not in self.subscriptions:
                 feed = RssFeed(name, self.entry_mgr, self.dev_mode)
                 self.subscriptions[name] = feed
@@ -193,7 +188,7 @@ class Announcements:
                     "moonraker", "announcements.stored_feeds", self.stored_feeds
                 )
                 result = "added"
-        elif action == "DELETE":
+        elif req_type == RequestType.DELETE:
             if name not in self.stored_feeds:
                 raise self.server.error(f"Feed '{name}' not stored")
             if name in self.configured_feeds:
@@ -241,7 +236,14 @@ class Announcements:
             "feed": feed
         }
         self.entry_mgr.add_entry(entry)
+        self.eventloop.create_task(self._notify_internal())
         return entry
+
+    async def _notify_internal(self) -> None:
+        entries = await self.entry_mgr.list_entries()
+        self.server.send_event(
+            "announcements:entries_updated", {"entries": entries}
+        )
 
     async def remove_announcement(self, entry_id: str) -> None:
         ret = await self.entry_mgr.remove_entry(entry_id)
@@ -259,6 +261,15 @@ class Announcements:
         self, include_dismissed: bool = False
     ) -> List[Dict[str, Any]]:
         return await self.entry_mgr.list_entries(include_dismissed)
+
+    def register_feed(self, name: str) -> None:
+        name = name.lower()
+        if name in self.subscriptions:
+            logging.info(f"Feed {name} already configured")
+            return
+        logging.info(f"Registering feed {name}")
+        self.configured_feeds.append(name)
+        self.subscriptions[name] = RssFeed(name, self.entry_mgr, self.dev_mode)
 
     def close(self):
         self.entry_mgr.close()

@@ -11,11 +11,12 @@
 from __future__ import annotations
 from enum import Enum
 import logging
-import json
 import asyncio
 import serial_asyncio
 from tornado.httpclient import AsyncHTTPClient
 from tornado.httpclient import HTTPRequest
+from ..utils import json_wrapper as jsonw
+from ..common import RequestType
 
 # Annotation imports
 from typing import (
@@ -28,10 +29,8 @@ from typing import (
 )
 
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
-    from websockets import WebRequest
-    from . import klippy_apis
-    APIComp = klippy_apis.KlippyAPI
+    from ..confighelper import ConfigHelper
+    from ..common import WebRequest
 
 class OnOff(str, Enum):
     on: str = "on"
@@ -295,7 +294,7 @@ class StripHttp(Strip):
             request = HTTPRequest(url=self.url,
                                   method="POST",
                                   headers=headers,
-                                  body=json.dumps(state),
+                                  body=jsonw.dumps(state),
                                   connect_timeout=self.timeout,
                                   request_timeout=self.timeout)
             for i in range(retries):
@@ -331,7 +330,7 @@ class StripSerial(Strip):
 
             logging.debug(f"WLED: serial:{self.serialport} json:{state}")
 
-            self.ser.write(json.dumps(state).encode())
+            self.ser.write(jsonw.dumps(state))
 
     def close(self: StripSerial):
         if hasattr(self, 'ser'):
@@ -390,23 +389,24 @@ class WLED:
         # As moonraker is about making things a web api, let's try it
         # Yes, this is largely a cut-n-paste from power.py
         self.server.register_endpoint(
-            "/machine/wled/strips", ["GET"],
-            self._handle_list_strips)
+            "/machine/wled/strips", RequestType.GET, self._handle_list_strips
+        )
         self.server.register_endpoint(
-            "/machine/wled/status", ["GET"],
-            self._handle_batch_wled_request)
+            "/machine/wled/status", RequestType.GET, self._handle_batch_wled_request
+        )
         self.server.register_endpoint(
-            "/machine/wled/on", ["POST"],
-            self._handle_batch_wled_request)
+            "/machine/wled/on", RequestType.POST, self._handle_batch_wled_request
+        )
         self.server.register_endpoint(
-            "/machine/wled/off", ["POST"],
-            self._handle_batch_wled_request)
+            "/machine/wled/off", RequestType.POST, self._handle_batch_wled_request
+        )
         self.server.register_endpoint(
-            "/machine/wled/toggle", ["POST"],
-            self._handle_batch_wled_request)
+            "/machine/wled/toggle", RequestType.POST, self._handle_batch_wled_request
+        )
         self.server.register_endpoint(
-            "/machine/wled/strip", ["GET", "POST"],
-            self._handle_single_wled_request)
+            "/machine/wled/strip", RequestType.GET | RequestType.POST,
+            self._handle_single_wled_request
+        )
 
     async def component_init(self) -> None:
         try:
@@ -447,9 +447,15 @@ class WLED:
     # Full control of wled
     # state: True, False, "on", "off"
     # preset: wled preset (int) to use (ignored if state False or "Off")
-    async def set_wled_state(self: WLED, strip: str, state: str = None,
-                             preset: int = -1, brightness: int = -1,
-                             intensity: int = -1, speed: int = -1) -> None:
+    async def set_wled_state(
+        self: WLED,
+        strip: str,
+        state: Optional[str] = None,
+        preset: int = -1,
+        brightness: int = -1,
+        intensity: int = -1,
+        speed: int = -1
+    ) -> None:
         status = None
 
         if isinstance(state, bool):
@@ -462,7 +468,8 @@ class WLED:
         if status is None and preset == -1 and brightness == -1 and \
            intensity == -1 and speed == -1:
             logging.info(
-                f"Invalid state received but no control or preset data passed")
+                "Invalid state received but no control or preset data passed"
+            )
             return
 
         if strip not in self.strips:
@@ -516,19 +523,19 @@ class WLED:
         intensity: int = web_request.get_int('intensity', -1)
         speed: int = web_request.get_int('speed', -1)
 
-        req_action = web_request.get_action()
+        req_type = web_request.get_request_type()
         if strip_name not in self.strips:
             raise self.server.error(f"No valid strip named {strip_name}")
         strip = self.strips[strip_name]
-        if req_action == 'GET':
+        if req_type == RequestType.GET:
             return {strip_name: strip.get_strip_info()}
-        elif req_action == "POST":
+        elif req_type == RequestType.POST:
             action = web_request.get_str('action').lower()
             if action not in ["on", "off", "toggle", "control"]:
-                raise self.server.error(
-                    f"Invalid requested action '{action}'")
-            result = await self._process_request(strip, action, preset,
-                                                 brightness, intensity, speed)
+                raise self.server.error(f"Invalid requested action '{action}'")
+            result = await self._process_request(
+                strip, action, preset, brightness, intensity, speed
+            )
         return {strip_name: result}
 
     async def _handle_batch_wled_request(self: WLED,

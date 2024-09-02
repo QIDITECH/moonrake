@@ -1,6 +1,81 @@
 ##
-This file will track changes that require user intervention,
-such as a configuration change or a reinstallation.
+This file tracks configuration changes and deprecations.  Additionally
+changest to Moonraker that require user intervention will be tracked
+here.
+
+### December 24th 2023
+- The `gpio` component no longer depends on `libgpiod`.  Instead,
+  Moonraker now uses the [python-periphery](https://github.com/vsergeev/python-periphery)
+  library to manage GPIOs.  This comes with several benefits:
+  - Distributions that do no ship with `libgpiod` will not fail during
+    installation if the `python3-libgpiod` package isn't present.
+  - Distributions with a Kernel Version of 5.5 or higher support bias
+    flags (ie: pull up or pull down).  Previously this functionality
+    was tied to the `libgpiod` version.  Specifically, Debian Buster
+    ships with a Kernel that supports bias, however the `libgpiod`
+    version does not.
+  - Version 2.0+ of `libgpiod` includes dramatic API changes that are
+    wholly incompatible with prior versions.  Therefore maintaining
+    future versions would effectively require supporting two APIs.
+- The `[button]` component now includes a `debounce_period` option.
+  This addition is the result of a behavior change in how gpio state
+  changes are debounced. Debouncing will now delay the event by the
+  time specified in the `debounce_period`.  Additional state changes
+  received during this delay will not trigger a button event.  The
+  `[button]` module retains the `minimum_event_time` option which will
+  ignore events shorter than the specified time.
+
+### July 18th 2023
+- The following changes have been made to `[update_manager <name>]`
+  extensions of the `git_repo` type:
+  - The `env` option has been deprecated.  New configurations should
+    use the `virtualenv` option in its place.
+  - The `install_script` option has been deprecated. New configurations
+    should use the `system_dependencies` option to specify system package
+    dependencies.
+- Configuration options for `[spoolman]` have been added
+- Configuration options for `[sensor]` have been added
+
+### Februrary 8th 2023
+- The `provider` option in the `[machine]` section no longer accepts
+  `supervisord` as an option.  It has been renamed to `supervisord_cli`.
+
+### January 2nd 2023
+- The `bound_service` option for `[power]` devices has been deprecated in
+  favor of `bound_services`.  Currently this change does not generate a
+  warning as it can be reliably resolved internally.
+
+### October 14th 2022
+- The systemd service file is now versioned.  Moonraker can now detect when
+  the file is out of date and automate corrections as necessary.
+- Moonraker's command line options are now specified in an environment file,
+  making it possible to change these options without modifying the service file
+  and reloading the systemd daemon.  The default location of the environment
+  file is `~/printer_data/systemd/moonraker.env`.
+- Moonraker now manages files and folders in a primary data folder supplied
+  by the `-d` (`--data-path`) command line option.  As a result, the following
+  options have been deprecated:
+    - `ssl_certificate_path` in `[server]`
+    - `ssl_key_path` in `[server]`
+    - `database_path` in `[database]`
+    - `config_path` in `[file_manager]`
+    - `log_path` in `[file_manager]`
+    - `secrets_path` in `[secrets]`
+- Debugging options are now supplied to Moonraker via the command line.
+  The `-v` (`--verbose`) option enables verbose logging, while the `-g`
+  (`--debug`) option enables debug features, including access to debug
+  endpoints and the repo debug feature in `update_manager`.  As a result,
+  the following options are deprecated:
+    - `enable_debug_logging` in `[server]`
+    - `enable_repo_debug` in `[update_manager]`
+
+### July 27th 2022
+- The behavior of `[include]` directives has changed.  Included files
+  are now parsed as they are encountered.  If sections are duplicated
+  options in the last section parsed take precendence.  If you are
+  using include directives to override configuration in `moonraker.conf`
+  the directives should be moved to the bottom of the file.
+- Configuration files now support inline comments.
 
 ### April 6th 2022
 - The ability to configure core components in the `[server]`section

@@ -6,14 +6,15 @@
 
 from __future__ import annotations
 import re
-import json
 import time
 import asyncio
 import pathlib
 import tempfile
 import logging
-from utils import ServerError
-from tornado.escape import url_escape, url_unescape
+import copy
+from ..utils import ServerError
+from ..utils import json_wrapper as jsonw
+from tornado.escape import url_unescape
 from tornado.httpclient import AsyncHTTPClient, HTTPRequest, HTTPError
 from tornado.httputil import HTTPHeaders
 from typing import (
@@ -27,8 +28,8 @@ from typing import (
     Any
 )
 if TYPE_CHECKING:
-    from moonraker import Server
-    from confighelper import ConfigHelper
+    from ..server import Server
+    from ..confighelper import ConfigHelper
     from io import BufferedWriter
     StrOrPath = Union[str, pathlib.Path]
 
@@ -39,18 +40,6 @@ AsyncHTTPClient.configure(
 )
 
 GITHUB_PREFIX = "https://api.github.com/"
-
-def escape_query_string(qs: str) -> str:
-    parts = qs.split("&")
-    escaped: List[str] = []
-    for p in parts:
-        item = p.split("=", 1)
-        key = url_escape(item[0])
-        if len(item) == 2:
-            escaped.append(f"{key}={url_escape(item[1])}")
-        else:
-            escaped.append(key)
-    return "&".join(escaped)
 
 class HttpClient:
     def __init__(self, config: ConfigHelper) -> None:
@@ -76,29 +65,14 @@ class HttpClient:
         if len(headers) == 0:
             raise self.server.error(
                 "Either an Etag or Last Modified Date must be specified")
-        empty_resp = HttpResponse(url, 200, b"", headers, None)
+        empty_resp = HttpResponse(url, url, 200, b"", headers, None)
         self.response_cache[url] = empty_resp
-
-    def escape_url(self, url: str) -> str:
-        # escape the url
-        match = re.match(r"(https?://[^/?#]+)([^?#]+)?(\?[^#]+)?(#.+)?", url)
-        if match is not None:
-            uri, path, qs, fragment = match.groups()
-            if path is not None:
-                uri += "/".join([url_escape(p, plus=False)
-                                 for p in path.split("/")])
-            if qs is not None:
-                uri += "?" + escape_query_string(qs[1:])
-            if fragment is not None:
-                uri += "#" + url_escape(fragment[1:], plus=False)
-            url = uri
-        return url
 
     async def request(
         self,
         method: str,
         url: str,
-        body: Optional[Union[str, List[Any], Dict[str, Any]]] = None,
+        body: Optional[Union[bytes, str, List[Any], Dict[str, Any]]] = None,
         headers: Optional[Dict[str, Any]] = None,
         connect_timeout: float = 5.,
         request_timeout: float = 10.,
@@ -113,7 +87,7 @@ class HttpClient:
         # prepare the body if required
         req_headers: Dict[str, Any] = {}
         if isinstance(body, (list, dict)):
-            body = json.dumps(body)
+            body = jsonw.dumps(body)
             req_headers["Content-Type"] = "application/json"
         cached: Optional[HttpResponse] = None
         if enable_cache:
@@ -160,10 +134,13 @@ class HttpClient:
                     continue
                 else:
                     result = resp.body
-                ret = HttpResponse(url, resp.code, result, resp.headers, err)
+                ret = HttpResponse(
+                    url, resp.effective_url, resp.code, result,
+                    resp.headers, err
+                )
                 break
         else:
-            ret = HttpResponse(url, 500, b"", HTTPHeaders(), err)
+            ret = HttpResponse(url, url, 500, b"", HTTPHeaders(), err)
         if enable_cache and ret.is_cachable():
             logging.debug(f"Caching HTTP Response: {url}")
             self.response_cache[cache_key] = ret
@@ -291,18 +268,70 @@ class HttpClient:
                 return dl.dest_file
         raise self.server.error(f"Retries exceeded for request: {url}")
 
+    def wrap_request(self, default_url: str, **kwargs) -> HttpRequestWrapper:
+        return HttpRequestWrapper(self, default_url, **kwargs)
+
     def close(self):
         self.client.close()
+
+class HttpRequestWrapper:
+    def __init__(
+        self, client: HttpClient, default_url: str, **kwargs
+    ) -> None:
+        self._do_request = client.request
+        self._last_response: Optional[HttpResponse] = None
+        self.default_request_args: Dict[str, Any] = {
+            "method": "GET",
+            "url": default_url,
+        }
+        self.default_request_args.update(kwargs)
+        self.request_args = copy.deepcopy(self.default_request_args)
+        self.reset()
+
+    async def send(self, **kwargs) -> HttpResponse:
+        req_args = copy.deepcopy(self.request_args)
+        req_args.update(kwargs)
+        method = req_args.pop("method", self.default_request_args["method"])
+        url = req_args.pop("url", self.default_request_args["url"])
+        self._last_response = await self._do_request(method, url, **req_args)
+        return self._last_response
+
+    def set_method(self, method: str) -> None:
+        self.request_args["method"] = method
+
+    def set_url(self, url: str) -> None:
+        self.request_args["url"] = url
+
+    def set_body(
+        self, body: Optional[Union[str, List[Any], Dict[str, Any]]]
+    ) -> None:
+        self.request_args["body"] = body
+
+    def add_header(self, name: str, value: str) -> None:
+        headers = self.request_args.get("headers", {})
+        headers[name] = value
+        self.request_args["headers"] = headers
+
+    def set_headers(self, headers: Dict[str, str]) -> None:
+        self.request_args["headers"] = headers
+
+    def reset(self) -> None:
+        self.request_args = copy.deepcopy(self.default_request_args)
+
+    def last_response(self) -> Optional[HttpResponse]:
+        return self._last_response
 
 class HttpResponse:
     def __init__(self,
                  url: str,
+                 final_url: str,
                  code: int,
                  result: bytes,
                  response_headers: HTTPHeaders,
                  error: Optional[BaseException]
                  ) -> None:
         self._url = url
+        self._final_url = final_url
         self._code = code
         self._result: bytes = result
         self._encoding: str = "utf-8"
@@ -312,8 +341,8 @@ class HttpResponse:
         self._last_modified: Optional[str] = response_headers.get(
             "last-modified", None)
 
-    def json(self, **kwargs) -> Union[List[Any], Dict[str, Any]]:
-        return json.loads(self._result, **kwargs)
+    def json(self) -> Union[List[Any], Dict[str, Any]]:
+        return jsonw.loads(self._result)
 
     def is_cachable(self) -> bool:
         return self._last_modified is not None or self._etag is not None
@@ -352,6 +381,10 @@ class HttpResponse:
     @property
     def url(self) -> str:
         return self._url
+
+    @property
+    def final_url(self) -> str:
+        return self._final_url
 
     @property
     def status_code(self) -> int:

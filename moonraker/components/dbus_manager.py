@@ -5,6 +5,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from __future__ import annotations
 import os
+import asyncio
 import pathlib
 import logging
 import dbus_next
@@ -16,11 +17,13 @@ from typing import (
     TYPE_CHECKING,
     List,
     Optional,
+    Any,
 )
 
 if TYPE_CHECKING:
-    from confighelper import ConfigHelper
+    from ..confighelper import ConfigHelper
 
+STAT_PATH = "/proc/self/stat"
 DOC_URL = (
     "https://moonraker.readthedocs.io/en/latest/"
     "installation/#policykit-permissions"
@@ -34,7 +37,11 @@ class DbusManager:
         self.bus: Optional[MessageBus] = None
         self.polkit: Optional[ProxyInterface] = None
         self.warned: bool = False
-        proc_data = pathlib.Path(f"/proc/self/stat").read_text()
+        st_path = pathlib.Path(STAT_PATH)
+        self.polkit_subject: List[Any] = []
+        if not st_path.is_file():
+            return
+        proc_data = st_path.read_text()
         start_clk_ticks = int(proc_data.split()[21])
         self.polkit_subject = [
             "unix-process",
@@ -51,6 +58,8 @@ class DbusManager:
         try:
             self.bus = MessageBus(bus_type=BusType.SYSTEM)
             await self.bus.connect()
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logging.info("Unable to Connect to D-Bus")
             return
@@ -60,20 +69,31 @@ class DbusManager:
                 "org.freedesktop.PolicyKit1",
                 "/org/freedesktop/PolicyKit1/Authority",
                 "org.freedesktop.PolicyKit1.Authority")
-        except self.DbusError:
-            self.server.add_warning(
-                "Unable to find DBus PolKit Interface, this suggests PolKit "
-                "is not installed on your OS.")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if self.server.is_debug_enabled():
+                logging.exception("Failed to get PolKit interface")
+            else:
+                logging.info(f"Failed to get PolKit interface: {e}")
+            self.polkit = None
 
     async def check_permission(self,
                                action: str,
                                err_msg: str = ""
                                ) -> bool:
         if self.polkit is None:
+            self.server.add_warning(
+                "Unable to find DBus PolKit Interface, this suggests PolKit "
+                "is not installed on your OS.",
+                "dbus_polkit"
+            )
             return False
         try:
             ret = await self.polkit.call_check_authorization(  # type: ignore
                 self.polkit_subject, action, {}, 0, "")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             self._check_warned()
             self.server.add_warning(

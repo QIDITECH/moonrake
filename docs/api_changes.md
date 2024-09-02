@@ -1,10 +1,53 @@
 ##
-This document keeps a record of all changes to Moonraker's web APIs.
+This document keeps a record of notable changes to Moonraker's Web API.
+
+### July 18th 2023
+- Moonraker API Version 1.3.0
+- Added [Spoolman](web_api.md#spoolman-apis) APIs.
+- Added [Rollback](web_api.md#rollback-to-the-previous-version) API to
+  the `update_manager`
+- The `update_manager` status response has new fields for items of the
+  `git_repo` and `web` types:
+  - `recovery_url`: Url of the repo a "hard" recovery will fetch from
+  - `rollback_version`: Version the extension will revert to when a rollback
+    is requested
+  - `warnings`: An array of strings containing various warnings detected
+    during repo init.  Some warnings may explain an invalid state while
+    others may alert users to potential issues, such as a `git_repo` remote
+    url not matching the expected (ie: configured) url.
+  - Additionally, the `need_channel_update` field has been removed as the method
+    changing channels is done exclusively in the configuration.
+
+### February 20th 2023
+- The following new endpoints are available when at least one `[sensor]`
+  section has been configured:
+  - `GET /server/sensors/list`
+  - `GET /server/sensors/sensor`
+  - `GET /server/sensors/measurements`
+
+  See [web_api.md](web_api.md) for details on these new endpoints.
+- A `sensors:sensor_update` notification has been added.  When at least one
+  monitored sensor is reporting a changed value Moonraker will broadcast this
+  notification.
+
+  See [web_api.md](web_api.md) for details on this new notification.
+
+### February 17 2023
+- Moonraker API Version 1.2.1
+- An error in the return value for some file manager endpoints has
+  been corrected.  Specifically, the returned result contains an `item` object
+  with a `path` field that was prefixed with the root (ie: "gcodes").
+  This is inconsistent with the websocket notification and has been corrected
+  to remove the prefix. This affects the following endpoints:
+    - `POST /server/files/directory` | `server.files.post_directory`
+    - `DELETE /server/files/directory` | `server.files.delete_directory`
+    - `POST /server/files/move` | `server.files.move`
+    - `POST /server/files/copy` | `server.files.copy`
 
 ### March 4th 2022
 - Moonraker API Version 1.0.1
 - The `server.websocket.id` endpoint has been deprecated. It is
-  recommended to use `server.connection.idenitfy` method to identify
+  recommended to use `server.connection.identify` method to identify
   your client.  This method returns a `connection_id` which is
   the websocket's unique id.  See
   [the documentation](web_api.md#identify-connection) for details.

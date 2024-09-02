@@ -1,40 +1,43 @@
-<p align="center"><img src="https://github.com/QIDITECH/QIDI_MAX3/blob/main/other/QIDI.png" height="240" alt="QIDI's logo" /></p>
-<p align="center"><a href="LICENSE"><img alt="GPL-V3.0 License" src="https://github.com/QIDITECH/QIDI_MAX3/blob/main/other/qidi.svg"></a></p>
 
-# Document Instructions
-The 3D printers of QIDI are based on Klipper.Based on the Klipper open source project, we have made some modifications to its source code to meet some of the user's needs.At the same time, we have also made modifications to Moonraker, so that the screens we set can correspond to the operations on the page.
-Thanks to the developers and maintainers of these open source projects.Please consider using or supporting these powerful projects.
-- <a href="https://github.com/Klipper3d/klipper">**Klipper**</a>
-- <a href="https://github.com/Arksine/moonraker">**Moonraker**</a>
+#  Moonraker - API Web Server for Klipper
 
-1. This document provides the modified moonraker version of QIDI.
-2. This document only provides methods for replacing source code for updates.  
-***Please note that manual updates may affect normal after-sales service.***  
+Moonraker is a Python 3 based web server that exposes APIs with which
+client applications may use to interact with the 3D printing firmware
+[Klipper](https://github.com/KevinOConnor/klipper). Communication between
+the Klippy host and Moonraker is done over a Unix Domain Socket.  Tornado
+is used to provide Moonraker's server functionality.
 
-## Detailed update process
-1. Connect your printer device through SSH.
-2. Confirm which software you need to replace.Download the corresponding file and replace the software through SSH connection.The following are the paths of each software within the system.
+Documentation for users and developers can be found on
+[Read the Docs](https://moonraker.readthedocs.io/en/latest/).
 
-  Software|Directory
-  ---|---
-  klipper|/home/mks/
-  moonraker|/home/mks/
+### Clients
 
-3. If there is no need to update xindi, simply replace it. For example, if I replace the klipper folder, save it and restart it.
+Note that Moonraker does not come bundled with a client, you will need to
+install one.  The following clients are currently available:
 
-## Report Issues and Make Suggestions
-You can contact [After-Sales Service](https://qidi3d.com/pages/warranty-policy-after-sales-support) to report issues and make suggestions.
+- [Mainsail](https://github.com/mainsail-crew/mainsail) by [Mainsail-Crew](https://github.com/mainsail-crew)
+- [Fluidd](https://github.com/fluidd-core/fluidd) by Cadriel
+- [KlipperScreen](https://github.com/jordanruthe/KlipperScreen) by jordanruthe
+- [mooncord](https://github.com/eliteSchwein/mooncord) by eliteSchwein
 
+### Raspberry Pi Images
 
+Moonraker is available pre-installed with the following Raspberry Pi images:
 
+- [MainsailOS](https://github.com/mainsail-crew/MainsailOS) by [Mainsail-Crew](https://github.com/mainsail-crew)
+  - Includes Klipper, Moonraker, and Mainsail
+- [FluiddPi](https://github.com/fluidd-core/FluiddPi) by Cadriel
+  - Includes Klipper, Moonraker, and Fluidd
 
+### Docker Containers
 
+The following projects deploy Moonraker via Docker:
 
+- [prind](https://github.com/mkuf/prind) by mkuf
+  - A suite of containers which allow you to run Klipper in
+    Docker.  Includes support for OctoPrint and Moonraker.
 
+### Changes
 
-
-
-
-
-
-  
+Please refer to the [changelog](https://moonraker.readthedocs.io/en/latest/changelog)
+for a list of notable changes to Moonraker.

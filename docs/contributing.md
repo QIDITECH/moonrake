@@ -1,10 +1,28 @@
 # Contributing to Moonraker
 
-While Moonraker exists as a service independently from Klipper, it relies
-on Klipper to be useful.  Thus, the tentative plan is to eventually merge
-the Moonraker application into the Klipper repo after Moonraker matures,
-at which point this repo will be archived.  As such, contibuting guidelines
-are near those of Klipper:
+Prior to submitting a pull request prospective contributors must read this
+entire document.  Care should be taken to [format git commits](#git-commit-format)
+correctly.  This eases the review process and provides the reviewer with
+confidence that the submission will be of sufficient quality.
+
+Prospective contributors should consider the following:
+
+- Does the contribution have significant impact?  Bug fixes to existing
+  functionality and new features requested by 100+ users qualify as
+  items of significant impact.
+- Has the submission been well tested?  Submissions with substantial code
+  change must include details about the testing procedure and results.
+- Does the submission include blocking code?  Moonraker is an asynchronous
+  application, thus blocking code must be avoided.
+- If any dependencies are included, are they pure python?  Many low-powered SBCs
+  running Armbian do not have prebuilt wheels and are not capable of building wheels
+  themselves, thus breaking updates on these systems.
+- Does the submission change the API?  If so, could the change potentially break
+  frontends using the API?
+- Does the submission include updates to the documentation?
+
+When performing reviews these are the questions that will be asked during the
+initial stages.
 
 #### New Module Contributions
 
@@ -105,24 +123,23 @@ By making a contribution to this project, I certify that:
 ```
 #### Code Style
 Python methods should be fully annotated. Variables should be annotated where
-the type cannot be inferred. Moonraker uses the `mypy` static type checker for
-code validation with the following options:
+the type cannot be inferred. Moonraker uses `mypy` version 1.5.1 for static
+type checking with the following options:
 
   - `--ignore-missing-imports`
   - `--follow-imports=silent`
 
-No line in the source code should exceed 80 characters.  Be sure there is no
+No line in the source code should exceed 88 characters.  Be sure there is no
 trailing whitespace.  To validate code before submission one may use
-`pycodestyle` with the following options:
+`flake8` version 6.1.0 with the following options:
 
   - `--ignore=E226,E301,E302,E303,W503,W504`
-  - `--max-line-length=80`
-  - `--max-doc-length=80`
+  - `--max-line-length=88`
+  - `--max-doc-length=88`
 
 Generally speaking, each line in submitted documentation should also be no
-longer than 80 characters, however there are situations where this isn't
-possible, such as long hyperlinks or example return values.  Documentation
-isn't linted, so it
+longer than 88 characters, however there are situations where this isn't
+possible, such as long hyperlinks or example return values.
 
-Don't peek into the member variables of another class.  Use getters or
+Avoid peeking into the member variables of another class.  Use getters or
 properties to access object state.
